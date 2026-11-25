@@ -1,0 +1,354 @@
+--- /dev/null
++++ b/vllm_ascend/ops/agmm.py
+@@ -0,0 +1,104 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Shape-stable AGMM primitives. Fusion policy stays inside opaque runtime ops.
++
++Unlike the original patch, decoder code never conditionally removes AllGather.
++The BF16 primitive returns the gathered input too, preserving GDN's BA branch.
++"""
++from __future__ import annotations
++import torch
++import torch.nn.functional as F
++import torch_npu
++from vllm.logger import logger
++from vllm.forward_context import get_forward_context
++from vllm.utils.torch_utils import direct_register_custom_op
++
++
++def _runtime_fusion_allowed(x: torch.Tensor, world_size: int, min_tokens: int) -> bool:
++    if world_size not in (2, 4, 8):
++        return False
++    try:
++        context = get_forward_context()
++    except AssertionError:
++        context = None
++    if context is not None and (getattr(context, "in_profile_run", False) or getattr(context, "is_draft_model", False)):
++        return False
++    threshold = min_tokens
++    if context is not None:
++        from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
++        capacity = get_mc2_tokens_capacity()
++        if capacity is not None:
++            threshold = max(threshold, capacity + 1)
++    tokens = getattr(context, "num_tokens", None) if context is not None else None
++    if tokens is None:
++        tokens = x.shape[0] * world_size
++    if tokens < threshold:
++        return False
++    # Keep capture/replay on the original collective implementation.
++    return not torch.npu.is_current_stream_capturing()
++
++
++def _gather(x: torch.Tensor, group_name: str, world_size: int) -> torch.Tensor:
++    return torch.ops.vllm.all_gather(x, 0, world_size, group_name=group_name)
++
++
++def _bf16_impl(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
++               group_name: str, world_size: int, hcom: str, min_tokens: int,
++               comm_mode: str) -> tuple[torch.Tensor, torch.Tensor]:
++    if _runtime_fusion_allowed(x, world_size, min_tokens):
++        logger.info_once("AGMM BF16 eager fusion selected; captured and small-token calls retain original collectives")
++        if comm_mode == "ccu" and callable(getattr(torch_npu, "npu_all_gather_quant_mm", None)):
++            output, gathered, _ = torch_npu.npu_all_gather_quant_mm(
++                x, weight.t(), hcom, world_size, bias=bias, gather_output=True,
++                y_dtype=x.dtype, comm_mode=comm_mode)
++            return output, gathered
++        if comm_mode == "aiv" and callable(getattr(torch_npu, "npu_all_gather_base_mm", None)):
++            return torch_npu.npu_all_gather_base_mm(
++                x, weight.t(), hcom, world_size, bias=bias, gather_index=0,
++                gather_output=True, comm_turn=0, output_dtype=x.dtype, comm_mode=comm_mode)
++    gathered = _gather(x, group_name, world_size)
++    return F.linear(gathered, weight, bias), gathered
++
++
++def _bf16_fake(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None,
++               group_name: str, world_size: int, hcom: str, min_tokens: int,
++               comm_mode: str) -> tuple[torch.Tensor, torch.Tensor]:
++    # Tensor metadata only: no ForwardContext, layer registry, HCCL or device query.
++    rows = x.shape[0] * world_size
++    return x.new_empty((rows, weight.shape[0])), x.new_empty((rows, x.shape[1]))
++
++
++def _mxfp8_impl(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
++                 group_size: int, scale_alg: int, group_name: str, world_size: int,
++                 hcom: str, min_tokens: int, comm_mode: str) -> torch.Tensor:
++    can_fuse = (_runtime_fusion_allowed(x, world_size, min_tokens)
++                and comm_mode == "ccu" and callable(getattr(torch_npu, "npu_all_gather_quant_mm", None)))
++    if can_fuse:
++        quantized, scale = torch_npu.npu_dynamic_mx_quant(
++            x, dst_type=torch.float8_e4m3fn, scale_alg=scale_alg)
++        output, _, _ = torch_npu.npu_all_gather_quant_mm(
++            quantized, weight, hcom, world_size, x1_scale=scale, x2_scale=weight_scale,
++            x1_dtype=torch.float8_e4m3fn, x2_dtype=torch.float8_e4m3fn,
++            x1_scale_dtype=torch_npu.float8_e8m0fnu, x2_scale_dtype=torch_npu.float8_e8m0fnu,
++            y_dtype=x.dtype, group_sizes=[1, 1, group_size], gather_output=False,
++            comm_mode=comm_mode)
++        return output
++    # No BF16-kernel fallback for FP8 weights: retain the original quantized math.
++    gathered = _gather(x, group_name, world_size)
++    quantized, scale = torch_npu.npu_dynamic_mx_quant(
++        gathered, dst_type=torch.float8_e4m3fn, scale_alg=scale_alg)
++    return torch_npu.npu_quant_matmul(
++        quantized, weight, weight_scale, scale_dtype=torch_npu.float8_e8m0fnu,
++        pertoken_scale=scale, pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
++        output_dtype=x.dtype, group_sizes=[1, 1, group_size])
++
++
++def _mxfp8_fake(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
++                 group_size: int, scale_alg: int, group_name: str, world_size: int,
++                 hcom: str, min_tokens: int, comm_mode: str) -> torch.Tensor:
++    return x.new_empty((x.shape[0] * world_size, weight.shape[1]))
++
++
++direct_register_custom_op("ascend_agmm_bf16", _bf16_impl, mutates_args=[],
++                          fake_impl=_bf16_fake, dispatch_key="PrivateUse1")
++direct_register_custom_op("ascend_agmm_mxfp8", _mxfp8_impl, mutates_args=[],
++                          fake_impl=_mxfp8_fake, dispatch_key="PrivateUse1")
+--- /dev/null
++++ b/vllm_ascend/compilation/passes/agmm_fusion_pass.py
+@@ -0,0 +1,189 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Fuse graph-visible AG + GEMM; preserve all AG consumers and token cropping."""
++from __future__ import annotations
++import operator
++import torch
++from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
++from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
++from vllm.logger import logger
++from vllm_ascend import envs
++from vllm_ascend.device.device_config import is_950
++from vllm_ascend.ops import agmm  # register opaque ops before graph rewriting
++
++_AG = torch.ops.vllm.all_gather.default
++_MM = torch.ops.vllm.unquantized_gemm.default
++
++def _is_op(target, overload):
++    return target is overload or target is overload.overloadpacket
++
++def _normalize_metadata(graph):
++    for node in graph.nodes:
++        if 'val' not in node.meta and 'example_value' in node.meta:
++            node.meta['val'] = node.meta['example_value']
++
++
++def _metadata(node, value):
++    from torch.fx.passes.shape_prop import _extract_tensor_metadata
++    from torch.utils._pytree import tree_map
++    meta = dict(node.meta)
++    meta["val"] = value
++    if "tensor_meta" in meta:
++        meta["tensor_meta"] = tree_map(_extract_tensor_metadata, value)
++    if "example_value" in meta:
++        meta["example_value"] = value
++    return meta
++
++
++def _slice_source(node):
++    if node.target == operator.getitem and len(node.args) == 2:
++        index = node.args[1]
++        if isinstance(index, slice) and index.start in (None, 0) and index.step in (None, 1):
++            return node.args[0], index.stop
++    if _is_op(node.target, torch.ops.aten.slice.Tensor):
++        args = node.args
++        if len(args) >= 4 and args[1] == 0 and args[2] == 0 and (len(args) < 5 or args[4] == 1):
++            return args[0], args[3]
++    return None
++
++
++def rewrite_bf16(graph_module, group_name, world_size, hcom, min_tokens, comm_mode):
++    graph = graph_module.graph if hasattr(graph_module, "graph") else graph_module
++    _normalize_metadata(graph)
++    matched = 0
++    for gather in list(graph.nodes):
++        if gather.op != "call_function" or not _is_op(gather.target, _AG):
++            continue
++        if len(gather.args) < 3 or gather.args[1] != 0 or gather.args[2] != world_size:
++            continue
++        name = gather.args[3] if len(gather.args) > 3 else gather.kwargs.get("group_name")
++        if name != group_name:
++            continue
++        candidates = []
++        for user in gather.users:
++            source = _slice_source(user) if user.op == "call_function" else None
++            if source and source[0] is gather:
++                candidates.extend((mm, source[1]) for mm in user.users if mm.op == "call_function" and _is_op(mm.target, _MM) and mm.args[0] is user)
++            elif user.op == "call_function" and _is_op(user.target, _MM) and user.args[0] is gather:
++                candidates.append((user, None))
++        valid = []
++        for mm, end in candidates:
++            x = gather.args[0].meta.get("val");w = mm.args[1].meta.get("val")
++            if not isinstance(x, torch.Tensor) or not isinstance(w, torch.Tensor):
++                continue
++            if x.ndim != 2 or w.ndim != 2 or x.dtype not in (torch.bfloat16, torch.float16) or x.dtype != w.dtype or w.shape[0]<256:
++                continue
++            if not isinstance(w.shape[0], int) or not isinstance(w.shape[1], int) or x.shape[1] != w.shape[1]:
++                continue
++            # Weight/bias must be available before AG, not derived from its output.
++            bias = mm.args[2] if len(mm.args) > 2 else mm.kwargs.get("bias")
++            if bias is not None or mm.meta.get("stream_label") != gather.meta.get("stream_label"):
++                continue
++            before = list(graph.nodes)[:list(graph.nodes).index(gather)]
++            if mm.args[1] not in before or (isinstance(bias, torch.fx.Node) and bias not in before):
++                continue
++            valid.append((mm, end, bias, w.shape[0]))
++        if not valid:
++            continue
++        mm, end, bias, _ = max(valid, key=lambda c:c[3])
++        with graph.inserting_before(gather):
++            fused = graph.call_function(torch.ops.vllm.ascend_agmm_bf16.default,
++                args=(gather.args[0], mm.args[1], bias, group_name, world_size, hcom, min_tokens, comm_mode))
++            y = graph.call_function(operator.getitem, args=(fused, 0))
++            full = graph.call_function(operator.getitem, args=(fused, 1))
++        y_value = agmm._bf16_fake(gather.args[0].meta["val"], mm.args[1].meta["val"], None,
++            group_name, world_size, hcom, min_tokens, comm_mode)[0]
++        fused.meta = _metadata(mm,(y_value,gather.meta["val"]))
++        y.meta = _metadata(mm,y_value)
++        full.meta = dict(gather.meta)
++        gather.replace_all_uses_with(full)
++        if end is not None:
++            with graph.inserting_before(mm):
++                y = graph.call_function(torch.ops.aten.slice.Tensor, args=(y, 0, 0, end, 1))
++        y.meta = dict(mm.meta)
++        mm.replace_all_uses_with(y);graph.erase_node(mm);graph.erase_node(gather)
++        matched += 1
++    graph.lint()
++    return matched
++
++
++def rewrite_mxfp8(graph_module, group_name, world_size, hcom, min_tokens, comm_mode):
++    if comm_mode != "ccu":
++        return 0
++    import torch_npu
++    graph = graph_module.graph if hasattr(graph_module,"graph") else graph_module
++    mx_op = torch.ops.npu.npu_dynamic_mx_quant.default
++    qmm_op = torch.ops.npu.npu_quant_matmul.default
++    _normalize_metadata(graph)
++    matched = 0
++    for mm in list(graph.nodes):
++        if mm.op != "call_function" or not _is_op(mm.target, qmm_op) or len(mm.args)<3:
++            continue
++        q, weight, weight_scale = mm.args[:3]
++        scale = mm.kwargs.get("pertoken_scale")
++        if not isinstance(q,torch.fx.Node) or q.target!=operator.getitem or q.args[1]!=0:
++            continue
++        mx=q.args[0]
++        if not _is_op(mx.target,mx_op) or not isinstance(scale,torch.fx.Node) or scale.target!=operator.getitem or scale.args!=(mx,1):
++            continue
++        if len(q.users)!=1 or len(scale.users)!=1 or set(mx.users)!={q,scale}:
++            continue
++        incoming=mx.args[0];crop=_slice_source(incoming)
++        gather,end=(crop if crop else (incoming,None))
++        if not _is_op(gather.target,_AG) or len(gather.users)!=1 or (crop and len(incoming.users)!=1):
++            continue  # another branch still needs the exact BF16 gathered input
++        name=gather.args[3] if len(gather.args)>3 else gather.kwargs.get("group_name")
++        if gather.args[1:3]!=(0,world_size) or name!=group_name:
++            continue
++        kwargs=mx.kwargs
++        if kwargs.get("axis",-1) not in (-1,1) or kwargs.get("block_size",32)!=32 or kwargs.get("scale_alg",0)!=0 or kwargs.get("round_mode","rint")!="rint":
++            continue
++        if mm.kwargs.get("group_sizes") not in ([1,1,32],(1,1,32)) or any(mm.kwargs.get(k) is not None for k in ("bias","offset","y_scale")):
++            continue
++        if any(mm.kwargs.get(k) != torch_npu.float8_e8m0fnu for k in ("scale_dtype","pertoken_scale_dtype")):
++            continue
++        xval=gather.args[0].meta.get("val");wval=weight.meta.get("val");qval=q.meta.get("val");outval=mm.meta.get("val")
++        if not all(isinstance(v,torch.Tensor) for v in (xval,wval,qval,outval)):
++            continue
++        if xval.ndim!=2 or wval.ndim!=2 or xval.dtype not in (torch.bfloat16,torch.float16) or qval.dtype!=torch.float8_e4m3fn or wval.dtype!=qval.dtype or outval.dtype!=xval.dtype:
++            continue
++        if xval.shape[1]!=wval.shape[0] or xval.shape[1]%32!=0:
++            continue
++        nodes=list(graph.nodes);before=nodes[:nodes.index(gather)]
++        if weight not in before or weight_scale not in before:
++            continue
++        if len({n.meta.get("stream_label") for n in [gather,incoming,mx,q,scale,mm]})!=1:
++            continue
++        with graph.inserting_before(gather):
++            result=graph.call_function(torch.ops.vllm.ascend_agmm_mxfp8.default,
++                args=(gather.args[0],weight,weight_scale,32,0,group_name,world_size,hcom,min_tokens,comm_mode))
++        result.meta=_metadata(mm,agmm._mxfp8_fake(xval,wval,weight_scale.meta["val"],32,0,group_name,world_size,hcom,min_tokens,comm_mode))
++        if end is not None:
++            with graph.inserting_before(mm):
++                result=graph.call_function(torch.ops.aten.slice.Tensor,args=(result,0,0,end,1))
++            result.meta=dict(mm.meta)
++        mm.replace_all_uses_with(result);graph.erase_node(mm)
++        for old in [q,scale,mx]+([incoming] if crop else [])+[gather]:
++            if not old.users:graph.erase_node(old)
++        matched+=1
++    graph.lint()
++    return matched
++
++
++class AGMMFusionPass(VllmInductorPass):
++    def __init__(self, config):
++        super().__init__(config)
++        group = get_tp_group();self.group_name = group.unique_name
++        self.world_size = get_tensor_model_parallel_world_size()
++        self.hcom = group.device_group._get_backend(torch.device("npu")).get_hccl_comm_name(group.rank_in_group)
++        sizes = config.compilation_config.cudagraph_capture_sizes or []
++        speculative = getattr(config.speculative_config, "num_speculative_tokens", 0) or 0
++        max_decode = max(sizes) if sizes else config.scheduler_config.max_num_seqs * (1 + speculative)
++        self.min_tokens = max_decode + 1  # derived from the unchanged configuration
++        self.comm_mode = "ccu" if is_950() else "aiv"
++    def __call__(self, graph):
++        self.begin();self.matched_count = rewrite_bf16(graph,self.group_name,self.world_size,self.hcom,self.min_tokens,self.comm_mode)
++        self.matched_count += rewrite_mxfp8(graph,self.group_name,self.world_size,self.hcom,self.min_tokens,self.comm_mode)
++        logger.info("AGMM metadata-v3 graph rewrite: %s projections; GDN auxiliary AG consumers retained",self.matched_count)
++        self.end_and_log()
++    def is_applicable_for_range(self, compile_range):
++        return self.world_size in (2,4,8)
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -29,6 +29,8 @@
+ 
+ 
+ env_variables: dict[str, Callable[[], Any]] = {
++    # Opt-in AGMM graph rewrite. Valid: 0/1, default 0; not sensitive.
++    "VLLM_ASCEND_ENABLE_AGMM": lambda: os.getenv("VLLM_ASCEND_ENABLE_AGMM", "0") == "1",
+     # max compile thread number for package building. Usually, it is set to
+     # the number of CPU cores. If not set, the default value is None, which
+     # means all number of CPU cores will be used.
+--- a/vllm_ascend/compilation/graph_fusion_pass_manager.py
++++ b/vllm_ascend/compilation/graph_fusion_pass_manager.py
+@@ -56,6 +56,11 @@
+         # raw additional_config dict (where e.g. "false" is truthy).
+         self.ascend_compilation_config = get_ascend_config().ascend_compilation_config
+         profile = get_current_hardware_profile()
++        from vllm_ascend import envs
++        if envs.VLLM_ASCEND_ENABLE_AGMM and enable_sp(config):
++            from .passes.agmm_fusion_pass import AGMMFusionPass
++            self.passes.append(AGMMFusionPass(config))
++
+         if self.ascend_compilation_config.fuse_norm_quant and profile.supports(
+             HardwareCapability.GRAPH_NORM_QUANT_FUSION
+         ):
+--- a/vllm_ascend/compilation/compiler_interface.py
++++ b/vllm_ascend/compilation/compiler_interface.py
+@@ -196,6 +196,11 @@
+     key: str | None = None,
+     cache_dir: str | None = None,
+ ) -> tuple[Callable | None, Any | None]:
++    from vllm_ascend import envs
++    if envs.VLLM_ASCEND_ENABLE_AGMM:
++        from .passes.agmm_fusion_pass import AGMMFusionPass
++        AGMMFusionPass(vllm_config)(graph)
++        graph.recompile()
+     # Try npugraph_ex first, fall back to torchair for backward compatibility.
+     try:
+         import npugraph_ex as nge
+@@ -286,6 +291,15 @@
+             "enable_static_kernel": ascend_compilation_config.enable_static_kernel,
+             "enable_super_kernel": ascend_compilation_config.enable_super_kernel,
+         }
++        from vllm_ascend import envs
++        if envs.VLLM_ASCEND_ENABLE_AGMM:
++            from pathlib import Path
++            package = Path(__file__).parent.parent
++            sources = [Path(__file__), package / "ops/agmm.py",
++                       package / "compilation/passes/agmm_fusion_pass.py"]
++            factors["agmm_source_hash"] = sha256(
++                b"".join(path.read_bytes() for path in sources),
++                usedforsecurity=False).hexdigest()
+         logger.info("AscendCompiler hash factors: %s", factors)
+         return sha256(str(factors).encode(), usedforsecurity=False).hexdigest()[:10]
+ 
